@@ -1,0 +1,51 @@
+name: cloudflare-web-search
+version: 0.1.0
+description: "Cloudflare Web Search API (Ceramic.ai, Exa, Linkup through AI Gateway) as a Hermes web_search backend. Search only."
+author: pew
+kind: backend
+provides_web_providers:
+  - cloudflare
+requires_env:
+  - name: CLOUDFLARE_ACCOUNT_ID
+    description: "Cloudflare account ID (or CLOUDFLARE_WEB_SEARCH_ACCOUNT_ID)"
+    url: "https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/"
+    secret: false
+  - name: CLOUDFLARE_API_TOKEN
+    description: "Cloudflare API token with Account > Workers AI > Read and Account > AI Gateway > Read (or CLOUDFLARE_WEB_SEARCH_API_TOKEN)"
+    url: "https://dash.cloudflare.com/profile/api-tokens"
+    secret: true
+optional_env:
+  - name: CLOUDFLARE_WEB_SEARCH_ACCOUNT_ID
+    description: "Dedicated Cloudflare account ID override for web search"
+  - name: CLOUDFLARE_WEB_SEARCH_API_TOKEN
+    description: "Dedicated Cloudflare API token override with Workers AI & AI Gateway Read permissions"
+    secret: true
+  - name: CLOUDFLARE_WEB_SEARCH_PROVIDER
+    description: "Search provider: ceramic (default), exa, or linkup"
+  - name: CLOUDFLARE_WEB_SEARCH_GATEWAY_ID
+    description: "Cloudflare AI Gateway ID (default: default)"
+  - name: CLOUDFLARE_WEB_SEARCH_BYOK_ALIAS
+    description: "Cloudflare AI Gateway Bring-Your-Own-Key alias"
+config_schema:
+  account_id:
+    type: string
+    description: "Cloudflare account ID (overrides CLOUDFLARE_ACCOUNT_ID)"
+  gateway_id:
+    type: string
+    default: "default"
+    description: "Cloudflare AI Gateway ID"
+  provider:
+    type: string
+    default: "ceramic"
+    description: "Search provider: ceramic, exa, or linkup"
+  byok_alias:
+    type: string
+    description: "Cloudflare AI Gateway Bring-Your-Own-Key alias"
+  timeout:
+    type: number
+    default: 20.0
+    description: "Search request timeout in seconds"
+  max_description_chars:
+    type: integer
+    default: 2000
+    description: "Max characters per result description (0 = no limit)"
