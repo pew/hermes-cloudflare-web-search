@@ -6,7 +6,7 @@ Pair it with a separate extract backend for `web_extract`.
 
 ## Requirements
 
-- Hermes Agent with Python 3.10+.
+- Hermes Agent with its supported Python environment, which supplies `httpx`.
 - A Cloudflare account ID and API token with **Account > Workers AI > Read** and
   **Account > AI Gateway > Read** permissions.
 - An AI Gateway with credits or a stored search provider key.

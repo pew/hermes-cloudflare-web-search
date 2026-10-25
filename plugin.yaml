@@ -5,7 +5,7 @@ author: pew
 kind: backend
 provides_web_providers:
   - cloudflare
-requires_env:
+optional_env:
   - name: CLOUDFLARE_ACCOUNT_ID
     description: "Cloudflare account ID (or CLOUDFLARE_WEB_SEARCH_ACCOUNT_ID)"
     url: "https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/"
@@ -14,7 +14,6 @@ requires_env:
     description: "Cloudflare API token with Account > Workers AI > Read and Account > AI Gateway > Read (or CLOUDFLARE_WEB_SEARCH_API_TOKEN)"
     url: "https://dash.cloudflare.com/profile/api-tokens"
     secret: true
-optional_env:
   - name: CLOUDFLARE_WEB_SEARCH_ACCOUNT_ID
     description: "Dedicated Cloudflare account ID override for web search"
   - name: CLOUDFLARE_WEB_SEARCH_API_TOKEN

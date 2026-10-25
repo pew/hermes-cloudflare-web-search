@@ -319,22 +319,33 @@ class CloudflareWebSearchProvider(WebSearchProvider):
             return False
 
     def get_setup_schema(self) -> Dict[str, Any]:
+        cfg = self._get_config()
+        env_vars = []
+        for names, yaml_value, prompt, url in (
+            (
+                (ACCOUNT_OVERRIDE_ENV, ACCOUNT_SEARCH_OVERRIDE_ENV, ACCOUNT_ENV),
+                cfg.get("account_id"),
+                "Cloudflare account ID (or set in config.yaml under web.cloudflare.account_id)",
+                "https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/",
+            ),
+            (
+                (TOKEN_OVERRIDE_ENV, TOKEN_SEARCH_OVERRIDE_ENV, TOKEN_ENV),
+                cfg.get("api_token") or cfg.get("token"),
+                "Cloudflare API token (Workers AI Read + AI Gateway Read)",
+                "https://dash.cloudflare.com/profile/api-tokens",
+            ),
+        ):
+            key = next((name for name in names[:2] if env_value(name)), None)
+            if key is None:
+                if yaml_value is not None and str(yaml_value).strip():
+                    continue
+                key = names[-1] if env_value(names[-1]) else names[0]
+            env_vars.append({"key": key, "prompt": prompt, "url": url})
         return {
             "name": DISPLAY_NAME,
             "badge": "paid",
             "tag": "Ceramic.ai / Exa / Linkup through AI Gateway \u2014 search only.",
-            "env_vars": [
-                {
-                    "key": ACCOUNT_ENV,
-                    "prompt": "Cloudflare account ID (or set in config.yaml under web.cloudflare.account_id)",
-                    "url": "https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/",
-                },
-                {
-                    "key": TOKEN_ENV,
-                    "prompt": "Cloudflare API token (Workers AI Read + AI Gateway Read)",
-                    "url": "https://dash.cloudflare.com/profile/api-tokens",
-                },
-            ],
+            "env_vars": env_vars,
         }
 
     # -- configuration -----------------------------------------------------
@@ -389,7 +400,7 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         search_provider = str(raw_provider).strip().lower()
         if search_provider and search_provider not in SEARCH_PROVIDERS:
             raise ConfigError(
-                f"{SEARCH_PROVIDER_ENV}={search_provider!r} is invalid; use one of: {', '.join(SEARCH_PROVIDERS)}"
+                f"{SEARCH_PROVIDER_ENV} is invalid; use one of: {', '.join(SEARCH_PROVIDERS)}"
             )
 
         # Gateway: env > config > default "default"
@@ -443,7 +454,7 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         try:
             value = int(raw)
         except (ValueError, TypeError):
-            raise ConfigError(f"{name} must be an integer, got {raw!r}")
+            raise ConfigError(f"{name} must be an integer")
         if value < minimum:
             raise ConfigError(f"{name} must be >= {minimum}")
         return value
@@ -455,7 +466,7 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         try:
             value = float(raw)
         except (ValueError, TypeError):
-            raise ConfigError(f"{name} must be a number of seconds, got {raw!r}")
+            raise ConfigError(f"{name} must be a number of seconds")
         if not math.isfinite(value) or value <= 0:
             raise ConfigError(f"{name} must be finite and > 0")
         return value

@@ -159,6 +159,45 @@ class ContractTests(ProviderTestCase):
         self.assertEqual(schema["name"], "Cloudflare Web Search")
         self.assertEqual([e["key"] for e in schema["env_vars"]], [cf.ACCOUNT_ENV, cf.TOKEN_ENV])
 
+    def test_picker_recognizes_supported_credential_sources(self):
+        from hermes_cli.tools_config import _provider_env_ready
+
+        cases = [
+            ({cf.ACCOUNT_OVERRIDE_ENV: ACCOUNT, cf.TOKEN_OVERRIDE_ENV: TOKEN}, {}),
+            ({cf.ACCOUNT_SEARCH_OVERRIDE_ENV: ACCOUNT, cf.TOKEN_SEARCH_OVERRIDE_ENV: TOKEN}, {}),
+            ({cf.TOKEN_OVERRIDE_ENV: TOKEN}, {"account_id": ACCOUNT}),
+            ({}, {"account_id": ACCOUNT, "api_token": TOKEN}),
+            ({}, {"account_id": ACCOUNT, "token": TOKEN}),
+        ]
+        for env, config in cases:
+            with self.subTest(env_names=list(env), config_names=list(config)):
+                self.env.clear()
+                self.env.update(env)
+                self.config_mock.clear()
+                self.config_mock.update(config)
+                self.assertTrue(self.provider.is_available())
+                with patch("hermes_cli.tools_config.get_env_value", side_effect=lambda name: self.env.get(name, "")):
+                    self.assertTrue(_provider_env_ready(self.provider.get_setup_schema()))
+        self.assertEqual(self.double.requests, [])
+
+    def test_picker_prompts_for_missing_credentials_with_dedicated_variables(self):
+        from hermes_cli.tools_config import _provider_env_ready
+
+        self.env.clear()
+        for config, expected_keys in (
+            ({}, [cf.ACCOUNT_OVERRIDE_ENV, cf.TOKEN_OVERRIDE_ENV]),
+            ({"account_id": ACCOUNT}, [cf.TOKEN_OVERRIDE_ENV]),
+            ({"api_token": TOKEN}, [cf.ACCOUNT_OVERRIDE_ENV]),
+        ):
+            with self.subTest(config_names=list(config)):
+                self.config_mock.clear()
+                self.config_mock.update(config)
+                schema = self.provider.get_setup_schema()
+                self.assertEqual([entry["key"] for entry in schema["env_vars"]], expected_keys)
+                with patch("hermes_cli.tools_config.get_env_value", return_value=None):
+                    self.assertFalse(_provider_env_ready(schema))
+        self.assertEqual(self.double.requests, [])
+
     def test_manifest_matches_provider(self):
         from hermes_cli.plugins_manifest import parse_manifest_file
 
@@ -166,11 +205,22 @@ class ContractTests(ProviderTestCase):
         self.assertIsNotNone(manifest)
         self.assertEqual(manifest.kind, "backend")
         self.assertEqual(manifest.version, cf.__version__)
-        self.assertEqual([e["name"] for e in manifest.requires_env], [cf.ACCOUNT_ENV, cf.TOKEN_ENV])
 
         # Also check raw manifest text contains provider name declaration
         raw_text = (ROOT / "plugin.yaml").read_text()
         self.assertIn(f"- {self.provider.name}", raw_text)
+
+    def test_installer_does_not_require_alternate_shared_credentials(self):
+        from hermes_cli.plugins_cmd import _missing_env_specs
+        from hermes_cli.plugins_manifest import parse_manifest_file
+
+        manifest = parse_manifest_file(ROOT / "plugin.yaml", ROOT, "user", "")
+        self.env.clear()
+        self.env[cf.TOKEN_OVERRIDE_ENV] = TOKEN
+        self.config_mock["account_id"] = ACCOUNT
+        self.assertTrue(self.provider.is_available())
+        with patch("hermes_cli.config.get_env_value", side_effect=lambda name: self.env.get(name, "")):
+            self.assertEqual(_missing_env_specs({"requires_env": manifest.requires_env}), [])
 
 
 class RequestTests(ProviderTestCase):
@@ -330,6 +380,17 @@ class ErrorTests(ProviderTestCase):
             with self.subTest(timeout=timeout):
                 self.env[cf.TIMEOUT_ENV] = timeout
                 self.assertFailure(self.provider.search("q"), cf.TIMEOUT_ENV, "finite")
+        self.assertEqual(self.double.requests, [])
+
+    def test_invalid_settings_do_not_echo_credentials(self):
+        token = "Synthetic-Private-Token"
+        self.env[cf.TOKEN_ENV] = token
+        for setting in (cf.SEARCH_PROVIDER_ENV, cf.MAX_DESCRIPTION_ENV, cf.TIMEOUT_ENV):
+            with self.subTest(setting=setting):
+                with patch.dict(self.env, {setting: token}):
+                    result = self.provider.search("q")
+                self.assertFailure(result, setting)
+                self.assertNotIn(token.lower(), result["error"].lower())
         self.assertEqual(self.double.requests, [])
 
     def test_empty_query_fails_without_request(self):
