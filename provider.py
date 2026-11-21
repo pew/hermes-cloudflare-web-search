@@ -10,7 +10,8 @@ backend with an extract provider (``web.extract_backend``) for ``web_extract``.
 
 Environment (``os.environ`` first, then ``~/.hermes/.env``):
 
-* ``CLOUDFLARE_ACCOUNT_ID`` (required)
+* ``CLOUDFLARE_ACCOUNT_ID`` (required). ``CLOUDFLARE_WEB_SEARCH_ACCOUNT_ID`` takes
+  precedence when set.
 * ``CLOUDFLARE_API_TOKEN`` (required; Account > Workers AI > Read and Account > AI Gateway > Read).
   ``CLOUDFLARE_WEB_SEARCH_API_TOKEN`` takes precedence when set, so a narrowly
   scoped token can be used without touching a shared ``CLOUDFLARE_API_TOKEN``.
@@ -75,6 +76,8 @@ TOKEN_HELP = "the token needs Account > Workers AI > Read and Account > AI Gatew
 _BYOK_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
 _RETRY_DELAY_SECONDS = 0.5
+_MAX_ERROR_DETAIL_CHARS = 500
+_MAX_RAW_ERROR_CHARS = 300
 
 
 class ConfigError(ValueError):
@@ -108,17 +111,27 @@ def search_fail(error: str) -> Dict[str, Any]:
 
 
 def redact_error(message: str, token: str) -> str:
-    """Strip the credential, including escaped representations used by HTTP errors."""
+    """Strip the credential, including escaped/URL-encoded forms used by HTTP errors."""
     if token:
-        for value in (token, repr(token)[1:-1], ascii(token)[1:-1], repr(token.encode())[2:-1]):
-            message = message.replace(value, "[redacted]")
+        candidates = (
+            token,
+            repr(token)[1:-1],
+            ascii(token)[1:-1],
+            repr(token.encode())[2:-1],
+            quote(token, safe=""),
+        )
+        for value in dict.fromkeys(candidates):
+            if value:
+                message = message.replace(value, "[redacted]")
     return message
 
 
 def clamp_limit(limit: Any) -> int:
+    if isinstance(limit, bool):
+        return DEFAULT_LIMIT
     try:
         value = int(limit)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_LIMIT
     return max(1, min(value, MAX_LIMIT))
 
@@ -163,7 +176,12 @@ def normalize_items(items: Any, limit: int, max_chars: int) -> List[Dict[str, An
         seen.add(url)
         title = item.get("title")
         title = title.strip() if isinstance(title, str) and title.strip() else url
-        desc = item.get("description") or item.get("snippet") or item.get("text") or ""
+        desc = ""
+        for field in ("description", "snippet", "text"):
+            val = item.get(field)
+            if isinstance(val, str) and val.strip():
+                desc = val
+                break
         rows.append({
             "title": title,
             "url": url,
@@ -192,8 +210,18 @@ def _messages(entries: Any) -> List[str]:
             if isinstance(path, list) and path:
                 message = f"{'.'.join(str(p) for p in path)}: {message.strip()}"
             code = entry.get("code")
-            out.append(f"{message.strip()} (code {code})" if isinstance(code, int) else message.strip())
+            if isinstance(code, int) and not isinstance(code, bool):
+                out.append(f"{message.strip()} (code {code})")
+            else:
+                out.append(message.strip())
     return out
+
+
+def _code_str(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def error_detail(payload: Any) -> Tuple[str, Optional[str]]:
@@ -210,12 +238,15 @@ def error_detail(payload: Any) -> Tuple[str, Optional[str]]:
     errors = payload.get("errors")
     if errors:
         parts += _messages(errors)
-        if isinstance(errors, list) and errors and isinstance(errors[0], dict) and errors[0].get("code") is not None:
-            code = str(errors[0]["code"])
+        if isinstance(errors, dict):
+            code = _code_str(errors.get("code"))
+        elif isinstance(errors, list) and errors and isinstance(errors[0], dict):
+            code = _code_str(errors[0].get("code"))
     err = payload.get("error")
     if isinstance(err, dict):
-        if err.get("code") is not None:
-            code = str(err["code"])
+        err_code = _code_str(err.get("code"))
+        if err_code is not None:
+            code = err_code
         message = err.get("message")
         if isinstance(message, str) and message.strip():
             parts.append(message.strip())
@@ -226,8 +257,10 @@ def error_detail(payload: Any) -> Tuple[str, Optional[str]]:
             parts.append(f"gateway request id {err['gatewayRequestId']}")
     elif isinstance(err, list):
         parts += _messages(err)
-        if err and isinstance(err[0], dict) and err[0].get("code") is not None:
-            code = str(err[0]["code"])
+        if err and isinstance(err[0], dict):
+            err_code = _code_str(err[0].get("code"))
+            if err_code is not None:
+                code = err_code
     elif isinstance(err, str) and err.strip():
         parts.append(err.strip())
     if not parts and isinstance(payload.get("message"), str):
@@ -235,8 +268,8 @@ def error_detail(payload: Any) -> Tuple[str, Optional[str]]:
     for detail in _messages(payload.get("messages")):
         if detail not in parts:
             parts.append(detail)
-    if code is None and payload.get("internalCode") is not None:
-        code = str(payload["internalCode"])
+    if code is None:
+        code = _code_str(payload.get("internalCode"))
     return "; ".join(dict.fromkeys(part for part in parts if part)), code
 
 
@@ -319,27 +352,43 @@ class CloudflareWebSearchProvider(WebSearchProvider):
             return False
 
     def get_setup_schema(self) -> Dict[str, Any]:
-        cfg = self._get_config()
+        try:
+            cfg = self._get_config()
+        except Exception:  # noqa: BLE001 — never hide the provider from `hermes tools`
+            cfg = {}
+
+        def _safe_env(name: str) -> str:
+            try:
+                return env_value(name)
+            except Exception:  # noqa: BLE001
+                return ""
+
         env_vars = []
-        for names, yaml_value, prompt, url in (
+        for names, keys, prompt, url in (
             (
                 (ACCOUNT_OVERRIDE_ENV, ACCOUNT_SEARCH_OVERRIDE_ENV, ACCOUNT_ENV),
-                cfg.get("account_id"),
+                ("account_id",),
                 "Cloudflare account ID (or set in config.yaml under web.cloudflare.account_id)",
                 "https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/",
             ),
             (
                 (TOKEN_OVERRIDE_ENV, TOKEN_SEARCH_OVERRIDE_ENV, TOKEN_ENV),
-                cfg.get("api_token") or cfg.get("token"),
+                ("api_token", "token"),
                 "Cloudflare API token (Workers AI Read + AI Gateway Read)",
                 "https://dash.cloudflare.com/profile/api-tokens",
             ),
         ):
-            key = next((name for name in names[:2] if env_value(name)), None)
+            key = next((name for name in names[:2] if _safe_env(name)), None)
             if key is None:
-                if yaml_value is not None and str(yaml_value).strip():
+                yaml_invalid = False
+                try:
+                    yaml_value = self._config_str(cfg, keys, setting_name=names[-1])
+                except ConfigError:
+                    yaml_value = ""
+                    yaml_invalid = True
+                if yaml_value:
                     continue
-                key = names[-1] if env_value(names[-1]) else names[0]
+                key = names[0] if yaml_invalid or not _safe_env(names[-1]) else names[-1]
             env_vars.append({"key": key, "prompt": prompt, "url": url})
         return {
             "name": DISPLAY_NAME,
@@ -349,6 +398,36 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         }
 
     # -- configuration -----------------------------------------------------
+    @staticmethod
+    def _config_str(
+        cfg: Dict[str, Any],
+        keys: Tuple[str, ...],
+        *,
+        setting_name: str,
+    ) -> str:
+        for key in keys:
+            val = cfg.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str):
+                stripped = val.strip()
+                if stripped:
+                    return stripped
+                continue
+            raise ConfigError(f"{setting_name} must be a string")
+        return ""
+
+    @staticmethod
+    def _config_first(cfg: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+        for key in keys:
+            val = cfg.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str) and not val.strip():
+                continue
+            return val
+        return None
+
     def _account_id(self, cfg: Optional[Dict[str, Any]] = None) -> str:
         if cfg is None:
             cfg = self._get_config()
@@ -357,9 +436,9 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         if override:
             return override
         # 2. config.yaml setting: account_id
-        val = cfg.get("account_id")
-        if val is not None and str(val).strip():
-            return str(val).strip()
+        val = self._config_str(cfg, ("account_id",), setting_name=ACCOUNT_ENV)
+        if val:
+            return val
         # 3. Base env: CLOUDFLARE_ACCOUNT_ID
         return env_value(ACCOUNT_ENV)
 
@@ -371,9 +450,9 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         if override:
             return override
         # 2. config.yaml setting: api_token or token
-        val = cfg.get("api_token") or cfg.get("token")
-        if val is not None and str(val).strip():
-            return str(val).strip()
+        val = self._config_str(cfg, ("api_token", "token"), setting_name=TOKEN_ENV)
+        if val:
+            return val
         # 3. Base env: CLOUDFLARE_API_TOKEN
         return env_value(TOKEN_ENV)
 
@@ -393,11 +472,9 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         raw_provider = (
             env_value(SEARCH_PROVIDER_ENV)
             or env_value(SEARCH_PROVIDER_ALIAS_ENV)
-            or cfg.get("search_provider")
-            or cfg.get("provider")
-            or ""
+            or self._config_str(cfg, ("search_provider", "provider"), setting_name=SEARCH_PROVIDER_ENV)
         )
-        search_provider = str(raw_provider).strip().lower()
+        search_provider = raw_provider.strip().lower()
         if search_provider and search_provider not in SEARCH_PROVIDERS:
             raise ConfigError(
                 f"{SEARCH_PROVIDER_ENV} is invalid; use one of: {', '.join(SEARCH_PROVIDERS)}"
@@ -407,34 +484,31 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         raw_gateway = (
             env_value(GATEWAY_ENV)
             or env_value(GATEWAY_ALIAS_ENV)
-            or cfg.get("gateway_id")
-            or cfg.get("gateway")
+            or self._config_str(cfg, ("gateway_id", "gateway"), setting_name=GATEWAY_ENV)
             or DEFAULT_GATEWAY_ID
         )
-        gateway_id = str(raw_gateway).strip() or DEFAULT_GATEWAY_ID
+        gateway_id = raw_gateway.strip() or DEFAULT_GATEWAY_ID
 
         # BYOK alias: env > config > ""
         raw_byok = (
             env_value(BYOK_ENV)
             or env_value(BYOK_ALIAS_ENV)
-            or cfg.get("byok_alias")
-            or cfg.get("byok")
-            or ""
+            or self._config_str(cfg, ("byok_alias", "byok"), setting_name=BYOK_ENV)
         )
-        byok_alias = str(raw_byok).strip()
+        byok_alias = raw_byok.strip()
         if byok_alias and not _BYOK_ALIAS_RE.match(byok_alias):
             raise ConfigError(f"{BYOK_ENV} must match ^[A-Za-z0-9_-]{{1,64}}$")
 
         # Max description chars: env > config > default 2000
-        raw_max_chars = env_value(MAX_DESCRIPTION_ENV) or env_value(MAX_DESCRIPTION_ALIAS_ENV)
+        raw_max_chars: Any = env_value(MAX_DESCRIPTION_ENV) or env_value(MAX_DESCRIPTION_ALIAS_ENV)
         if not raw_max_chars:
-            raw_max_chars = cfg.get("max_description_chars", cfg.get("max_snippet_length", cfg.get("max_chars")))
+            raw_max_chars = self._config_first(cfg, ("max_description_chars", "max_snippet_length", "max_chars"))
         max_chars = self._coerce_int(MAX_DESCRIPTION_ENV, raw_max_chars, DEFAULT_MAX_DESCRIPTION_CHARS, minimum=0)
 
         # Timeout: env > config > default 20.0
-        raw_timeout = env_value(TIMEOUT_ENV) or env_value(TIMEOUT_SEARCH_ENV)
+        raw_timeout: Any = env_value(TIMEOUT_ENV) or env_value(TIMEOUT_SEARCH_ENV)
         if not raw_timeout:
-            raw_timeout = cfg.get("timeout")
+            raw_timeout = self._config_first(cfg, ("timeout",))
         timeout = self._coerce_float(TIMEOUT_ENV, raw_timeout, DEFAULT_TIMEOUT)
 
         return {
@@ -449,11 +523,15 @@ class CloudflareWebSearchProvider(WebSearchProvider):
 
     @staticmethod
     def _coerce_int(name: str, raw: Any, default: int, *, minimum: int) -> int:
+        if isinstance(raw, str):
+            raw = raw.strip()
         if raw is None or raw == "":
             return default
+        if isinstance(raw, (bool, float)):
+            raise ConfigError(f"{name} must be an integer")
         try:
             value = int(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             raise ConfigError(f"{name} must be an integer")
         if value < minimum:
             raise ConfigError(f"{name} must be >= {minimum}")
@@ -461,11 +539,15 @@ class CloudflareWebSearchProvider(WebSearchProvider):
 
     @staticmethod
     def _coerce_float(name: str, raw: Any, default: float) -> float:
+        if isinstance(raw, str):
+            raw = raw.strip()
         if raw is None or raw == "":
             return default
+        if isinstance(raw, bool):
+            raise ConfigError(f"{name} must be a number of seconds")
         try:
             value = float(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             raise ConfigError(f"{name} must be a number of seconds")
         if not math.isfinite(value) or value <= 0:
             raise ConfigError(f"{name} must be finite and > 0")
@@ -568,6 +650,7 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
         if payload.get("success") is False or payload.get("ok") is False:
             detail, _ = error_detail(payload)
+            detail = self._redact_and_cap(detail, settings["token"], _MAX_ERROR_DETAIL_CHARS)
             return search_fail(f"{VENDOR} error: {detail or 'request was not successful'}")
         items = data.get("items")
         if not isinstance(items, list):
@@ -584,11 +667,20 @@ class CloudflareWebSearchProvider(WebSearchProvider):
         return {"success": True, "data": {"web": rows}}
 
     @staticmethod
-    def _http_error(response: httpx.Response, payload: Any, settings: Dict[str, Any]) -> str:
+    def _redact_and_cap(text: str, token: str, limit: int) -> str:
+        redacted = redact_error(text, token).strip()
+        if len(redacted) > limit:
+            return redacted[:limit].rstrip() + "\u2026"
+        return redacted
+
+    @classmethod
+    def _http_error(cls, response: httpx.Response, payload: Any, settings: Dict[str, Any]) -> str:
         status = response.status_code
         detail, code = error_detail(payload)
-        if not detail:
-            detail = redact_error(response.text or "", settings["token"]).strip()[:300] or f"HTTP {status}"
+        if detail:
+            detail = cls._redact_and_cap(detail, settings["token"], _MAX_ERROR_DETAIL_CHARS)
+        else:
+            detail = cls._redact_and_cap(response.text or "", settings["token"], _MAX_RAW_ERROR_CHARS) or f"HTTP {status}"
         message = f"{VENDOR} returned HTTP {status}: {detail}"
 
         hint = ""

@@ -205,10 +205,35 @@ class ContractTests(ProviderTestCase):
         self.assertIsNotNone(manifest)
         self.assertEqual(manifest.kind, "backend")
         self.assertEqual(manifest.version, cf.__version__)
+        self.assertIn("web.cloudflare", manifest.config_keys)
 
-        # Also check raw manifest text contains provider name declaration
+        # Also check raw manifest text contains provider name and primary optional_env declarations
         raw_text = (ROOT / "plugin.yaml").read_text()
         self.assertIn(f"- {self.provider.name}", raw_text)
+        for env_name in (
+            cf.ACCOUNT_ENV,
+            cf.TOKEN_ENV,
+            cf.ACCOUNT_OVERRIDE_ENV,
+            cf.TOKEN_OVERRIDE_ENV,
+            cf.SEARCH_PROVIDER_ENV,
+            cf.GATEWAY_ENV,
+            cf.BYOK_ENV,
+            cf.MAX_DESCRIPTION_ENV,
+            cf.TIMEOUT_ENV,
+        ):
+            self.assertIn(f"name: {env_name}", raw_text)
+
+    def test_setup_schema_never_raises_on_broken_config_or_env_error(self):
+        with patch.object(cf, "load_web_config", side_effect=cf.ConfigError("broken config")):
+            schema = self.provider.get_setup_schema()
+        self.assertEqual(schema["name"], "Cloudflare Web Search")
+        self.assertEqual([e["key"] for e in schema["env_vars"]], [cf.ACCOUNT_ENV, cf.TOKEN_ENV])
+
+        with patch.object(cf, "load_web_config", side_effect=cf.ConfigError("broken config")), \
+                patch.object(cf, "env_value", side_effect=RuntimeError("unscoped")):
+            schema = self.provider.get_setup_schema()
+        self.assertEqual([e["key"] for e in schema["env_vars"]], [cf.ACCOUNT_OVERRIDE_ENV, cf.TOKEN_OVERRIDE_ENV])
+        self.assertEqual(self.double.requests, [])
 
     def test_installer_does_not_require_alternate_shared_credentials(self):
         from hermes_cli.plugins_cmd import _missing_env_specs
@@ -254,7 +279,18 @@ class RequestTests(ProviderTestCase):
         })
 
     def test_limit_is_clamped_to_api_range(self):
-        for requested, sent in ((50, 10), (0, 1), (-3, 1), ("7", 7), ("bad", 5), (None, 5)):
+        for requested, sent in (
+            (50, 10),
+            (0, 1),
+            (-3, 1),
+            ("7", 7),
+            ("bad", 5),
+            (None, 5),
+            (True, 5),
+            (False, 5),
+            (float("inf"), 5),
+            (float("-inf"), 5),
+        ):
             self.double.queue(200, {"items": []})
             self.provider.search("q", requested)
             self.assertEqual(self.double.requests[-1]["body"]["limit"], sent, requested)
@@ -299,6 +335,8 @@ class ResponseTests(ProviderTestCase):
         items = [
             {"url": "https://example.com/1", "title": "Doc 1", "snippet": "Snippet content"},
             {"url": "https://example.com/2", "title": "Doc 2", "text": "Text content"},
+            {"url": "https://example.com/3", "title": "Doc 3", "description": "   ", "snippet": "After whitespace"},
+            {"url": "https://example.com/4", "title": "Doc 4", "description": 123, "text": "After non-string"},
         ]
         self.double.queue(200, {"items": items})
         res = self.provider.search("q", 5)
@@ -306,6 +344,8 @@ class ResponseTests(ProviderTestCase):
         rows = res["data"]["web"]
         self.assertEqual(rows[0]["description"], "Snippet content")
         self.assertEqual(rows[1]["description"], "Text content")
+        self.assertEqual(rows[2]["description"], "After whitespace")
+        self.assertEqual(rows[3]["description"], "After non-string")
 
     def test_result_count_respects_limit(self):
         items = [{"url": f"https://e.com/{i}", "title": str(i), "description": ""} for i in range(10)]
@@ -463,8 +503,74 @@ class ErrorTests(ProviderTestCase):
         self.assertFailure(provider.search("q"), "Could not reach Cloudflare Web Search")
 
     def test_unexpected_exception_is_wrapped(self):
-        with patch.object(cf.httpx, "post", side_effect=RuntimeError("kaboom")):
+        with patch.object(cf.httpx, "post", side_effect=RuntimeError("kaboom")), \
+                self.assertLogs(cf.logger, level="WARNING"):
             self.assertFailure(self.provider.search("q"), "search failed: kaboom")
+
+    def test_http_200_error_envelope_fails_and_redacts(self):
+        self.double.queue(200, {"success": False, "errors": [{"code": 7001, "message": f"bad {TOKEN}"}]})
+        result = self.provider.search("q")
+        self.assertFailure(result, "bad [redacted] (code 7001)")
+        self.assertNotIn(TOKEN, result["error"])
+
+        self.double.queue(200, {"ok": False, "error": {"code": "upstream_failed", "message": "failed"}})
+        self.assertFailure(self.provider.search("q"), "failed")
+
+    def test_credit_error_hints(self):
+        self.double.queue(402, {"errors": [{"message": "Payment required"}]})
+        self.assertFailure(self.provider.search("q"), "HTTP 402", "AI Gateway credits")
+
+        self.double.queue(400, {"errors": [{"message": "Insufficient credits remaining"}]})
+        self.assertFailure(self.provider.search("q"), "AI Gateway credits")
+
+    def test_transient_timeout_and_request_error_retry_and_succeed(self):
+        real_post = cf.httpx.post
+        for exc in (cf.httpx.ReadTimeout("slow"), cf.httpx.ConnectError("reset")):
+            with self.subTest(exc=type(exc).__name__):
+                self.double.queue(200, {"items": [{"url": "https://e.com", "title": "E"}]})
+                calls = {"n": 0}
+
+                def flaky_post(*args, exc=exc, calls=calls, **kwargs):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise exc
+                    return real_post(*args, **kwargs)
+
+                with patch.object(cf.httpx, "post", side_effect=flaky_post):
+                    result = self.provider.search("q")
+                self.assertTrue(result["success"])
+                self.assertEqual(calls["n"], 2)
+
+    def test_interrupt_after_transport_error_stops_retry(self):
+        for exc in (cf.httpx.ReadTimeout("slow"), cf.httpx.ConnectError("reset")):
+            with self.subTest(exc=type(exc).__name__):
+                interrupted = False
+
+                def fail_and_interrupt(*args, exc=exc, **kwargs):
+                    nonlocal interrupted
+                    interrupted = True
+                    raise exc
+
+                with patch.object(cf, "_interrupted", side_effect=lambda: interrupted), \
+                        patch.object(cf.httpx, "post", side_effect=fail_and_interrupt) as mocked:
+                    self.assertEqual(self.provider.search("q"), {"success": False, "error": "Interrupted"})
+                self.assertEqual(mocked.call_count, 1)
+
+    def test_url_encoded_token_and_long_json_error_are_redacted_and_capped(self):
+        secret = "tok/with+special=chars-and-extra-length"
+        self.env[cf.TOKEN_ENV] = secret
+        encoded = cf.quote(secret, safe="")
+        self.double.queue(400, {"errors": [{"message": f"bad {encoded}"}]})
+        short_result = self.provider.search("q")
+        self.assertFailure(short_result, "bad [redacted]")
+        self.assertNotIn("tok%2F", short_result["error"])
+        self.assertNotIn(encoded, short_result["error"])
+
+        self.double.queue(400, {"errors": [{"message": f"{'a' * 490}{secret} and {'b' * 100}"}]})
+        result = self.provider.search("q")
+        self.assertFalse(result["success"])
+        self.assertNotIn("tok/with", result["error"])
+        self.assertLess(len(result["error"]), 600)
 
     def test_interrupt_short_circuits(self):
         with patch.object(cf, "_interrupted", return_value=True):
@@ -546,6 +652,26 @@ class HelperTests(unittest.TestCase):
         with patch.dict("os.environ", {"CF_WS_TEST_VAR": "  value  "}):
             self.assertEqual(cf.env_value("CF_WS_TEST_VAR"), "value")
 
+    def test_error_detail_handles_boolean_code_and_dict_errors(self):
+        detail, code = cf.error_detail({"errors": {"code": 9106, "message": "Denied"}})
+        self.assertEqual(detail, "Denied (code 9106)")
+        self.assertEqual(code, "9106")
+
+        detail_bool, code_bool = cf.error_detail({"errors": [{"code": True, "message": "Odd"}]})
+        self.assertEqual(detail_bool, "Odd")
+        self.assertIsNone(code_bool)
+
+        detail_dict_bool, code_dict_bool = cf.error_detail({"errors": {"code": False, "message": "Odd"}})
+        self.assertEqual(detail_dict_bool, "Odd")
+        self.assertIsNone(code_dict_bool)
+
+        detail_err_bool, code_err_bool = cf.error_detail({"ok": False, "error": {"code": True}})
+        self.assertEqual(detail_err_bool, "")
+        self.assertIsNone(code_err_bool)
+
+        _, code_internal_bool = cf.error_detail({"internalCode": True})
+        self.assertIsNone(code_internal_bool)
+
 
 class RegistrationTests(unittest.TestCase):
     def test_register_loads_like_hermes_directory_plugin(self):
@@ -573,13 +699,97 @@ class RegistrationTests(unittest.TestCase):
 class ConfigYamlTests(ProviderTestCase):
     def test_config_read_failure_is_reported_without_search(self):
         self.config_patch.stop()
-        with patch("hermes_cli.config.load_config_readonly", side_effect=ValueError("broken config")), \
-                patch("hermes_cli.config.load_config", side_effect=ValueError("broken config")):
-            result = self.provider.search("q")
-            self.assertFalse(result["success"])
-            self.assertIn("configuration", result["error"])
-            self.assertFalse(self.provider.is_available())
+        try:
+            with patch("hermes_cli.config.load_config_readonly", side_effect=ValueError("broken config")), \
+                    patch("hermes_cli.config.load_config", side_effect=ValueError("broken config")):
+                result = self.provider.search("q")
+                self.assertFalse(result["success"])
+                self.assertIn("configuration", result["error"])
+                self.assertFalse(self.provider.is_available())
+            self.assertEqual(self.double.requests, [])
+        finally:
+            self.config_patch.start()
+
+    def test_non_string_and_boolean_yaml_values_are_rejected(self):
+        for bad_cfg, needle in (
+            ({"timeout": True}, cf.TIMEOUT_ENV),
+            ({"timeout": False}, cf.TIMEOUT_ENV),
+            ({"timeout": float("inf")}, cf.TIMEOUT_ENV),
+            ({"max_description_chars": True}, cf.MAX_DESCRIPTION_ENV),
+            ({"max_description_chars": False}, cf.MAX_DESCRIPTION_ENV),
+            ({"max_description_chars": 150.7}, cf.MAX_DESCRIPTION_ENV),
+            ({"max_description_chars": float("inf")}, cf.MAX_DESCRIPTION_ENV),
+            ({"provider": True}, cf.SEARCH_PROVIDER_ENV),
+            ({"gateway_id": False}, cf.GATEWAY_ENV),
+            ({"byok_alias": ["a"]}, cf.BYOK_ENV),
+        ):
+            with self.subTest(bad_cfg=bad_cfg):
+                self.config_mock.clear()
+                self.config_mock.update(bad_cfg)
+                result = self.provider.search("q")
+                self.assertFalse(result["success"])
+                self.assertIn(needle, result["error"])
+
+        self.env.clear()
+        self.config_mock.clear()
+        self.config_mock.update({"account_id": False, "api_token": True})
+        self.assertFalse(self.provider.is_available())
+        schema = self.provider.get_setup_schema()
+        self.assertEqual([e["key"] for e in schema["env_vars"]], [cf.ACCOUNT_OVERRIDE_ENV, cf.TOKEN_OVERRIDE_ENV])
+        result = self.provider.search("q")
+        self.assertFalse(result["success"])
+        self.assertIn(cf.ACCOUNT_ENV, result["error"])
+        self.assertIn("must be a string", result["error"])
+
+        # Invalid YAML credentials must not silently fall back to shared env vars or YAML aliases.
+        self.env.clear()
+        self.env.update({cf.ACCOUNT_ENV: ACCOUNT, cf.TOKEN_ENV: TOKEN})
+        self.config_mock.clear()
+        self.config_mock.update({"api_token": False})
+        self.assertFalse(self.provider.is_available())
+        schema = self.provider.get_setup_schema()
+        self.assertEqual([e["key"] for e in schema["env_vars"]], [cf.ACCOUNT_ENV, cf.TOKEN_OVERRIDE_ENV])
+        result = self.provider.search("q")
+        self.assertFalse(result["success"])
+        self.assertIn(cf.TOKEN_ENV, result["error"])
+        self.assertIn("must be a string", result["error"])
+
+        self.env.clear()
+        self.config_mock.clear()
+        self.config_mock.update({"account_id": ACCOUNT, "api_token": False, "token": TOKEN})
+        self.assertFalse(self.provider.is_available())
+        schema = self.provider.get_setup_schema()
+        self.assertEqual([e["key"] for e in schema["env_vars"]], [cf.TOKEN_OVERRIDE_ENV])
+        result = self.provider.search("q")
+        self.assertFalse(result["success"])
+        self.assertIn(cf.TOKEN_ENV, result["error"])
+        self.assertIn("must be a string", result["error"])
         self.assertEqual(self.double.requests, [])
+
+    def test_whitespace_primary_yaml_keys_fall_back_to_aliases(self):
+        self.env.clear()
+        self.config_mock.update({
+            "account_id": ACCOUNT,
+            "api_token": "   ",
+            "token": TOKEN,
+            "search_provider": "   ",
+            "provider": "exa",
+            "gateway_id": "   ",
+            "gateway": "alias-gw",
+            "byok_alias": "   ",
+            "byok": "alias-byok",
+            "max_description_chars": "   ",
+            "max_snippet_length": 321,
+            "timeout": "   ",
+        })
+        self.assertTrue(self.provider.is_available())
+        settings = self.provider._settings()
+        self.assertEqual(settings["token"], TOKEN)
+        self.assertEqual(settings["search_provider"], "exa")
+        self.assertEqual(settings["gateway_id"], "alias-gw")
+        self.assertEqual(settings["byok_alias"], "alias-byok")
+        self.assertEqual(settings["max_chars"], 321)
+        self.assertEqual(settings["timeout"], cf.DEFAULT_TIMEOUT)
 
     def test_account_id_configured_in_config_yaml_without_env(self):
         del self.env[cf.ACCOUNT_ENV]
